@@ -225,60 +225,6 @@ async def fetch_usd_price(session: ClientSession, chain: str, token_address: str
 
             await asyncio.sleep(1)
             retries += 1
-"""
-curl -X 'GET' \
-  'https://api.geckoterminal.com/api/v2/simple/networks/eth/token_price/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2%2C0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' \
-  -H 'accept: application/json'
-
-RESPONSE:
-{
-  "data": {
-    "id": "95e5eae1-7e85-44e7-812c-a61536c87e40",
-    "type": "simple_token_price",
-    "attributes": {
-      "token_prices": {
-        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "0.999453368879243",
-        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "2602.07"
-      }
-    }
-  }
-}
-"""
-GECKO_SEMAPHORE = asyncio.Semaphore(1)
-async def fetch_current_prices(session: ClientSession, chain: str, token_addresses: set[str]) -> dict[str, Decimal | None]:
-    results: dict[str, Decimal | None] = {
-        addr: None for addr in token_addresses
-    }
-    async with GECKO_SEMAPHORE:
-        addrs = list(token_addresses)
-        while addrs: # max 30 addresses per request
-            formatted_addrs = ",".join(addrs[:5])
-            addrs = addrs[5:]
-            print(addrs)
-            url = f"https://api.geckoterminal.com/api/v2/simple/networks/{chain}/token_price/{formatted_addrs}"
-            retries = 0
-            while True:
-                try:
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            resp_json = await response.json()
-                            for tk_addr, price in resp_json["data"]["attributes"]["token_prices"].items():
-                                results[tk_addr.lower()] = Decimal(price)
-                            break
-                        if response.status == 429:
-                            logger.warning(f"RESPONSE 429 FOR PRICE {url}: {response.status}, SLEEPING")
-                            await asyncio.sleep(5)
-                            continue
-                        logger.warning(f"FAILED TO FETCH PRICE {url}: {response.status}, RETRYING")
-                        retries += 1
-                except:
-                    retries += 1
-                    logger.warning(f"FAILED TO FETCH PRICE {url}: {traceback.format_exc()}\nRETRYING")
-                if retries >= 5:
-                    logger.error(f"FAILED TO FETCH PRICE {url} AFTER {retries} RETRIES")
-                    break # fail to price these tokens
-
-        return results
 
 async def price_transfers(transfers: list[Transfer]):
     to_price: set[tuple[str, str, int]] = set()
@@ -321,41 +267,6 @@ async def price_transfers(transfers: list[Transfer]):
         tk_price = priced[(tr.chain, tr.token.address, tr.block_number)]
         if tk_price is not None:
             tr.balance.usd_amount = tk_price * tr.balance.amount
-
-async def portfolio_snapshot(transfers: list[Transfer]) -> dict[str, dict[str, Balance]]:
-    net_balances: dict[str, dict[str, Balance]] = {}
-    for tr in transfers:
-        if tr.chain not in net_balances:
-            net_balances[tr.chain] = {}
-        if tr.token.address not in net_balances[tr.chain]:
-            net_balances[tr.chain][tr.token.address] = Balance(Decimal(0), None)
-        net_balances[tr.chain][tr.token.address].amount += tr.balance.amount
-
-    to_price: set[tuple[str, str]] = set()
-    for tr in transfers:
-        if not tr.balance.usd_amount: # skip unpriceables
-            continue
-        to_price.add((tr.chain, tr.token.address))
-
-    tasks = {}
-    async with ClientSession() as session:
-        async with asyncio.TaskGroup() as tg:
-            for chain, token_address in to_price:
-                tasks[chain, token_address] = tg.create_task(
-                    fetch_usd_price(session, chain, token_address, None)
-                )
-
-    priced: dict[tuple[str, str], Decimal] = {}
-    for (chain, token_address), task in tasks.items():
-        price = task.result()
-        if price is not None:
-            priced[(chain, token_address)] = price
-
-    # add usd amounts to net balances
-    for (chain, token_address), price in priced.items():
-        net_balances[chain][token_address].usd_amount = price * net_balances[chain][token_address].amount
-
-    return net_balances
 
 async def calculate_token_flows(transfers: list[Transfer]) -> dict[str, dict[str, Flow]]:
     flows: dict[str, dict[str, Flow]] = {}
@@ -456,18 +367,6 @@ async def main():
 
     await price_transfers(transfers)
 
-    """
-    unique_tokens = set()
-    for tr in transfers:
-        if tr.balance.usd_amount is None:
-            continue
-        unique_tokens.add(f"{tr.chain} {str(tr.token)}")
-
-    sorted_tokens = sorted(unique_tokens)
-    for ut in sorted_tokens:
-        print(ut)
-    """
-
     token_flows = merge_chains(await calculate_token_flows(transfers))
 
     print(json.dumps(token_flows, indent=4, cls=JSONEnc))
@@ -494,25 +393,6 @@ async def main():
 
     print()
     print(f"TOTAL USD (available to lose): {total_usd}")
-
-    # portfolio = await portfolio_snapshot(transfers)
-    # total = Decimal(0)
-    # for chain, tk_balances in portfolio.items():
-    #     for balance in tk_balances.values():
-    #         if balance.usd_amount is not None:
-    #             total += balance.usd_amount
-
-    # # pruned_portfolio with only non-zero balances
-    # pruned_portfolio = {
-    #     chain: {
-    #         token_address: balance
-    #         for token_address, balance in tk_balances.items()
-    #         if balance.amount > 0
-    #     }
-    #     for chain, tk_balances in portfolio.items()
-    # }
-    # print(json.dumps(pruned_portfolio, indent=4, cls=JSONEnc))
-    # print(f"TOTAL: {total}")
 
 if __name__ == "__main__":
     asyncio.run(main())
