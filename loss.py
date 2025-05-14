@@ -476,13 +476,24 @@ async def main():
     for flow in token_flows.values():
         total_loss_usd += flow.lost_usd
 
+    print()
     print(f"TOTAL LOSS USD: {total_loss_usd}")
 
     # sort tokens by loss
     top_losers = sorted(token_flows.items(), key=lambda x: x[1].lost_usd, reverse=True)
+    print()
     print("TOP LOSERS:")
     for symbol, flow in top_losers:
         print(f"{symbol}:\t{flow.lost_usd}")
+
+    # calculate total usd holdings
+    total_usd = Decimal(0)
+    for flow in token_flows.values():
+        if flow.holding_usd is not None:
+            total_usd += flow.holding_usd
+
+    print()
+    print(f"TOTAL USD (available to lose): {total_usd}")
 
     # portfolio = await portfolio_snapshot(transfers)
     # total = Decimal(0)
