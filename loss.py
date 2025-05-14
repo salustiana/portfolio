@@ -4,7 +4,7 @@ import asyncio
 import logging
 import traceback
 from decimal import Decimal
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, is_dataclass, asdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,15 +17,51 @@ load_dotenv()
 TRANSLATE_API_KEY = os.environ["TRANSLATE_API_KEY"]
 
 @dataclass
+class Flow:
+    purchased_usd: Decimal
+    sold_usd: Decimal
+    holding_usd: Decimal
+    holding: Decimal
+    lost_usd: Decimal
+
+_symbol_cache = {}
+@dataclass
+class Token:
+    address: str
+    symbol: str
+
+    def __post_init__(self):
+        self.address = self.address.lower()
+        self.symbol = self.symbol.upper()
+
+        if self.address in _symbol_cache:
+            assert _symbol_cache[self.address] == self.symbol, f"Symbol mismatch for {self.address}: {_symbol_cache[self.address]} != {self.symbol}"
+        else:
+            _symbol_cache[self.address] = self.symbol
+
+    def __str__(self):
+        return f"{self.symbol} {self.address}"
+
+    @staticmethod
+    def get_symbol(address: str) -> str:
+        address = address.lower()
+        if address not in _symbol_cache:
+            raise
+        return _symbol_cache[address]
+
+@dataclass
+class Balance:
+    amount: Decimal
+    usd_amount: Decimal | None
+
+@dataclass
 class Transfer:
     wallet: str
     chain: str
     block_number: int
-    token_address: str
-    token_symbol: str
-    amount: Decimal
+    token: Token
+    balance: Balance
     timestamp: int
-    usd_amount: Decimal | None
     counterpart: str
     tx_type: str
     action: str
@@ -34,11 +70,12 @@ class JSONEnc(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, Decimal):
             return float(o)
-        if isinstance(o, Transfer):
-            return asdict(o)
+        if is_dataclass(o):
+            return asdict(o) # type: ignore
         return super().default(o)
 
 async def start_txs_job(session: ClientSession, wallet: str, chain: str) -> str:
+    logger.info(f"STARTING JOB FOR {wallet} ON {chain}")
     url = f"https://translate.noves.fi/evm/{chain}/txs/job/start"
     headers = {
         "accept": "application/json",
@@ -86,11 +123,9 @@ def parse_transfers(tx: dict) -> list[Transfer]:
                 wallet=wallet,
                 chain=chain,
                 block_number=block_number,
-                token_address=tr["token"]["address"].lower(),
-                token_symbol=tr["token"].get("symbol", ""),
-                amount=side * Decimal(tr["amount"]),
+                token=Token(tr["token"]["address"], tr["token"].get("symbol", "")),
+                balance=Balance(amount=side * Decimal(tr["amount"]), usd_amount=None),
                 timestamp=timestamp,
-                usd_amount=None,
                 counterpart=(tr.get(counterside, {}).get("address") or "").lower(),
                 tx_type=tx_type,
                 action=tr["action"]
@@ -99,6 +134,7 @@ def parse_transfers(tx: dict) -> list[Transfer]:
     return results
 
 async def gather_job_results(session: ClientSession, url: str) -> list[dict]:
+    logger.info(f"GATHERING JOB RESULTS FOR {url}")
     headers = {
         "accept": "application/json",
         "apiKey": TRANSLATE_API_KEY
@@ -136,7 +172,6 @@ def fetch_cached_transfers(wallet: str, chain: str) -> list[dict] | None:
     if not os.path.exists(f"./cache/{wallet}/{chain}.json"):
         return None
 
-    logger.info(f"CACHE HIT FOR {wallet} ON {chain}")
     with open(f"./cache/{wallet}/{chain}.json", "r") as f:
         return json.load(f)
 
@@ -159,6 +194,7 @@ async def fetch_transfers(wallet: str, chain: str) -> list[Transfer]:
 
 PRICING_SEMAPHORE = asyncio.Semaphore(20)
 async def fetch_usd_price(session: ClientSession, chain: str, token_address: str, block_number: int | None) -> Decimal | None:
+    logger.info(f"FETCHING PRICE FOR {chain} {token_address} {block_number}")
     url = f"https://pricing.noves.fi/evm/{chain}/price/{token_address}"
     headers = {"apiKey": TRANSLATE_API_KEY}
     params = {"blockNumber": block_number} if block_number is not None else {}
@@ -247,14 +283,13 @@ async def fetch_current_prices(session: ClientSession, chain: str, token_address
 async def price_transfers(transfers: list[Transfer]):
     to_price: set[tuple[str, str, int]] = set()
     for tr in transfers:
-        to_price.add((tr.chain, tr.token_address, tr.block_number))
+        to_price.add((tr.chain, tr.token.address, tr.block_number))
 
     priced: dict[tuple[str, str, int], Decimal | None] = {}
 
     for chain, token_address, block in to_price.copy():
         cache_fpath = f"./cache/prices/{chain}/{token_address}/{block}"
         if os.path.exists(cache_fpath):
-            logger.info(f"PRICE CACHE HIT FOR {chain} {token_address} {block}")
             with open(cache_fpath) as f:
                 content = f.read().strip()
                 if not content:
@@ -283,18 +318,24 @@ async def price_transfers(transfers: list[Transfer]):
         priced[(chain, token_address, block)] = price
 
     for tr in transfers:
-        tk_price = priced[(tr.chain, tr.token_address, tr.block_number)]
-        if tk_price is None:
-            tr.usd_amount = None
-        else:
-            tr.usd_amount = tk_price * tr.amount
+        tk_price = priced[(tr.chain, tr.token.address, tr.block_number)]
+        if tk_price is not None:
+            tr.balance.usd_amount = tk_price * tr.balance.amount
 
-async def portfolio_snapshot(transfers: list[Transfer]) -> dict[str, dict[str, Decimal]]:
+async def portfolio_snapshot(transfers: list[Transfer]) -> dict[str, dict[str, Balance]]:
+    net_balances: dict[str, dict[str, Balance]] = {}
+    for tr in transfers:
+        if tr.chain not in net_balances:
+            net_balances[tr.chain] = {}
+        if tr.token.address not in net_balances[tr.chain]:
+            net_balances[tr.chain][tr.token.address] = Balance(Decimal(0), None)
+        net_balances[tr.chain][tr.token.address].amount += tr.balance.amount
+
     to_price: set[tuple[str, str]] = set()
     for tr in transfers:
-        if not tr.usd_amount:
+        if not tr.balance.usd_amount: # skip unpriceables
             continue
-        to_price.add((tr.chain, tr.token_address))
+        to_price.add((tr.chain, tr.token.address))
 
     tasks = {}
     async with ClientSession() as session:
@@ -310,19 +351,90 @@ async def portfolio_snapshot(transfers: list[Transfer]) -> dict[str, dict[str, D
         if price is not None:
             priced[(chain, token_address)] = price
 
+    # add usd amounts to net balances
+    for (chain, token_address), price in priced.items():
+        net_balances[chain][token_address].usd_amount = price * net_balances[chain][token_address].amount
 
-    portfolio: dict[str, dict[str, Decimal]] = {}
+    return net_balances
+
+async def calculate_token_flows(transfers: list[Transfer]) -> dict[str, dict[str, Flow]]:
+    flows: dict[str, dict[str, Flow]] = {}
     for tr in transfers:
-        if priced.get((tr.chain, tr.token_address)) is None:
-            # logger.warning(f"NO PRICE FOR {tr.chain} {tr.token_address}")
+        if tr.balance.usd_amount is None:
             continue
-        if tr.chain not in portfolio:
-            portfolio[tr.chain] = {}
-        key = f"{tr.token_symbol.upper()} ({tr.token_address.lower()})"
-        if key not in portfolio[tr.chain]:
-            portfolio[tr.chain][key] = Decimal(0)
-        portfolio[tr.chain][key] += tr.amount * priced[(tr.chain, tr.token_address)]
-    return portfolio
+        if tr.chain not in flows:
+            flows[tr.chain] = {}
+        if str(tr.token) not in flows[tr.chain]:
+            flows[tr.chain][str(tr.token)] = Flow(Decimal(0), Decimal(0), Decimal(0), Decimal(0), Decimal(0))
+        flows[tr.chain][str(tr.token)].holding += tr.balance.amount
+        if tr.balance.usd_amount > 0:
+            flows[tr.chain][str(tr.token)].purchased_usd += tr.balance.usd_amount
+        else:
+            flows[tr.chain][str(tr.token)].sold_usd -= tr.balance.usd_amount
+
+    # price the current holdings
+    tasks = {}
+    async with ClientSession() as session:
+        async with asyncio.TaskGroup() as tg:
+            for chain, tk_flows in flows.items():
+                for token_str in tk_flows:
+                    token_address = token_str.split(" ")[-1]
+                    tasks[chain, token_str] = tg.create_task(
+                        fetch_usd_price(session, chain, token_address, None)
+                    )
+
+    for (chain, token_str), task in tasks.items():
+        price = task.result()
+        if price is None:
+            continue
+        flows[chain][token_str].holding_usd = flows[chain][token_str].holding * price
+
+    # calculate the lost usd
+    for tk_flows in flows.values():
+        for flow in tk_flows.values():
+            flow.lost_usd = flow.purchased_usd - flow.sold_usd - flow.holding_usd
+
+    return flows
+
+def prune_transfers(transfers: list[Transfer], wallets: set[str]) -> list[Transfer]:
+    # remove transfers where the counterpart is one of the wallets in the list
+    result: list[Transfer] = []
+    must_find: set[tuple[str, str, int, str, Decimal]] = set()
+    for tr in transfers:
+        if not tr.balance.amount:
+            logger.debug(f"TRANSFER WITH NO AMOUNT: {tr}")
+            continue
+        if tr.counterpart not in wallets:
+            result.append(tr)
+            continue
+
+        sender = tr.wallet if tr.balance.amount < 0 else tr.counterpart
+        transferred = tr.balance.amount if sender == tr.wallet else -tr.balance.amount
+        key = (sender, tr.chain, tr.block_number, tr.token.address, transferred)
+        if key not in must_find:
+            must_find.add(key)
+            continue
+        must_find.remove(key)
+
+    assert not must_find, f"UNMATCHED TRANSFERS: {must_find}"
+
+    return result
+
+def merge_chains(token_flows: dict[str, dict[str, Flow]]) -> dict[str, Flow]:
+    # XXX: asumes tokens with the same symbol to be the same token
+    merged_flows: dict[str, Flow] = {}
+    for tk_flows in token_flows.values():
+        for token_str, flow in tk_flows.items():
+            symbol = token_str.split(" ")[0]
+            if symbol not in merged_flows:
+                merged_flows[symbol] = Flow(Decimal(0), Decimal(0), Decimal(0), Decimal(0), Decimal(0))
+            merged_flows[symbol].holding += flow.holding
+            merged_flows[symbol].purchased_usd += flow.purchased_usd
+            merged_flows[symbol].sold_usd += flow.sold_usd
+            merged_flows[symbol].holding_usd += flow.holding_usd
+            merged_flows[symbol].lost_usd += flow.lost_usd
+
+    return merged_flows
 
 async def main():
     wallet_chains = {
@@ -340,17 +452,56 @@ async def main():
     for task in tasks:
         transfers.extend(task.result())
 
+    transfers = prune_transfers(transfers, set(wallet_chains.keys()))
+
     await price_transfers(transfers)
 
-    portfolio = await portfolio_snapshot(transfers)
-    total = Decimal(0)
-    for chain, tk_usd_amounts in portfolio.items():
-        for _, usd_amount in tk_usd_amounts.items():
-            total += usd_amount
+    """
+    unique_tokens = set()
+    for tr in transfers:
+        if tr.balance.usd_amount is None:
+            continue
+        unique_tokens.add(f"{tr.chain} {str(tr.token)}")
 
-    print(f"TOTAL USD AMOUNT: {total}")
+    sorted_tokens = sorted(unique_tokens)
+    for ut in sorted_tokens:
+        print(ut)
+    """
 
-    print(json.dumps(portfolio, indent=4, cls=JSONEnc))
+    token_flows = merge_chains(await calculate_token_flows(transfers))
+
+    print(json.dumps(token_flows, indent=4, cls=JSONEnc))
+
+    total_loss_usd = Decimal(0)
+    for flow in token_flows.values():
+        total_loss_usd += flow.lost_usd
+
+    print(f"TOTAL LOSS USD: {total_loss_usd}")
+
+    # sort tokens by loss
+    top_losers = sorted(token_flows.items(), key=lambda x: x[1].lost_usd, reverse=True)
+    print("TOP LOSERS:")
+    for symbol, flow in top_losers:
+        print(f"{symbol}:\t{flow.lost_usd}")
+
+    # portfolio = await portfolio_snapshot(transfers)
+    # total = Decimal(0)
+    # for chain, tk_balances in portfolio.items():
+    #     for balance in tk_balances.values():
+    #         if balance.usd_amount is not None:
+    #             total += balance.usd_amount
+
+    # # pruned_portfolio with only non-zero balances
+    # pruned_portfolio = {
+    #     chain: {
+    #         token_address: balance
+    #         for token_address, balance in tk_balances.items()
+    #         if balance.amount > 0
+    #     }
+    #     for chain, tk_balances in portfolio.items()
+    # }
+    # print(json.dumps(pruned_portfolio, indent=4, cls=JSONEnc))
+    # print(f"TOTAL: {total}")
 
 if __name__ == "__main__":
     asyncio.run(main())
